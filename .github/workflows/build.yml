@@ -11,32 +11,33 @@ permissions:
 
 jobs:
   build:
-    name: "Loom: ${{ matrix.strategy }}"
+    name: "Loom: ${{ matrix.strategy }} (JDK ${{ matrix.java }})"
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - strategy: newest_release   # 1.18.4 — гипотеза: валидация исправлена
-            gradle: '9.7.1'
-          - strategy: loom_113         # новейший 1.13.x — средняя точка
-            gradle: '9.7.1'
-          - strategy: loom_112         # новейший 1.12.x — ближайшая к сломанной 1.11
-            gradle: '8.14.2'
-          - strategy: loom_110         # 1.10.5 — гипотеза: javadoc-процессора нет
-            gradle: '8.14.2'
+          - { strategy: loom_113,           java: '21', gradle: '9.7.1' }
+          - { strategy: loom_114,           java: '21', gradle: '9.7.1' }
+          - { strategy: loom_115,           java: '21', gradle: '9.7.1' }
+          - { strategy: loom_116,           java: '21', gradle: '9.7.1' }
+          - { strategy: loom_117,           java: '21', gradle: '9.7.1' }
+          - { strategy: newest_release,     java: '25', gradle: '9.7.1' }
+          - { strategy: loom11_oldest_fapi, java: '21', gradle: '8.14.2' }
     env:
       LOOM_STRATEGY: ${{ matrix.strategy }}
+      JAVA_VER: ${{ matrix.java }}
+      GRADLE_VER: ${{ matrix.gradle }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up JDK 21 (Temurin)
+      - name: Set up JDK
         uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: ${{ matrix.java }}
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -59,6 +60,7 @@ jobs:
           REQUIRED_MC="1.21.11"
           fetch() { curl -fsSL -A "$UA" "$1" 2>/dev/null || true; }
           read_prop() { grep -m1 "^$1=" gradle.properties | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '[:space:]\r'; }
+          newest_of() { printf '%s\n' "$1" | grep -viE 'SNAPSHOT|alpha|beta|pre|rc' | sort -V | tail -n 1; }
 
           MC="$(read_prop minecraft_version)"
           if [ "$MC" != "$REQUIRED_MC" ]; then
@@ -68,36 +70,43 @@ jobs:
 
           META="$(fetch https://maven.fabricmc.net/net/fabricmc/fabric-loom/maven-metadata.xml)"
           LOOM_ALL="$(printf '%s' "$META" | grep -o '<version>[^<]*</version>' | sed 's/<[^>]*>//g' || true)"
-          stable() { printf '%s\n' "$1" | grep -viE 'SNAPSHOT|alpha|beta|pre|rc' | sort -V | tail -n 1; }
-          LOOM_NEWEST="$(stable "$LOOM_ALL" || true)"
-          LOOM_113="$(stable "$(printf '%s\n' "$LOOM_ALL" | grep -E '^1\.13\.')" || true)"
-          LOOM_112="$(stable "$(printf '%s\n' "$LOOM_ALL" | grep -E '^1\.12\.')" || true)"
-          LOOM_110="$(stable "$(printf '%s\n' "$LOOM_ALL" | grep -E '^1\.10\.')" || true)"
+          LOOM_NEWEST="$(newest_of "$LOOM_ALL" || true)"
 
+          LOOM=""
+          OLDEST_FAPI="false"
           case "$LOOM_STRATEGY" in
-            newest_release) LOOM="$LOOM_NEWEST" ;;
-            loom_113)       LOOM="$LOOM_113" ;;
-            loom_112)       LOOM="$LOOM_112" ;;
-            loom_110)       LOOM="$LOOM_110" ;;
-            *) LOOM="" ;;
+            newest_release)     LOOM="$LOOM_NEWEST" ;;
+            loom11_oldest_fapi) LOOM="1.11.8"; OLDEST_FAPI="true" ;;
+            loom_1*)
+              LINE="${LOOM_STRATEGY#loom_}"   # 113 -> 13
+              LOOM="$(newest_of "$(printf '%s\n' "$LOOM_ALL" | grep -E "^1\.${LINE#1}\.")" || true)"
+              ;;
           esac
           if [ -z "$LOOM" ]; then
-            echo "::error::Strategy '$LOOM_STRATEGY': no Loom version found on maven.fabricmc.net"
+            echo "::error::Strategy '$LOOM_STRATEGY': no Loom version found on maven"
             exit 1
           fi
           sed -i "s/id 'fabric-loom' version '[^']*'/id 'fabric-loom' version '$LOOM'/" build.gradle
 
-          # Yarn/Loader/Fabric API — сами, строго под 1.21.11 (эталон теперь под 26.3, он не источник)
           YARN="$(fetch https://meta.fabricmc.net/v2/versions/yarn \
             | jq -r --arg mc "$MC" '[.[] | select(.gameVersion == $mc)][0].version // empty')"
           LOADER="$(fetch https://meta.fabricmc.net/v2/versions/loader \
             | jq -r '[.[] | select(.stable == true)][0].version')"
-          VJ="$(fetch "https://api.modrinth.com/v2/project/fabric-api/version?game_versions=%5B%22${MC}%22%5D&loaders=%5B%22fabric%22%5D")"
-          FAPI="$(printf '%s' "$VJ" | jq -r '.[0].version_number // empty')"
-          if [ -z "$FAPI" ]; then
+
+          if [ "$OLDEST_FAPI" = "true" ]; then
+            # Запасной сценарий: самая СТАРАЯ сборка Fabric API для 1.21.11 +
+            # Loom 1.11.8 (единственный, дошедший до setup Minecraft без JDK-проблем)
             FAPI="$(fetch https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml \
-              | grep -o "<version>[^<]*+${MC}</version>" | sed 's/<[^>]*>//g' | sort -V | tail -n1)"
+              | grep -o "<version>[^<]*+${MC}</version>" | sed 's/<[^>]*>//g' | sort -V | head -n1)"
+          else
+            VJ="$(fetch "https://api.modrinth.com/v2/project/fabric-api/version?game_versions=%5B%22${MC}%22%5D&loaders=%5B%22fabric%22%5D")"
+            FAPI="$(printf '%s' "$VJ" | jq -r '.[0].version_number // empty')"
+            if [ -z "$FAPI" ]; then
+              FAPI="$(fetch https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml \
+                | grep -o "<version>[^<]*+${MC}</version>" | sed 's/<[^>]*>//g' | sort -V | tail -n1)"
+            fi
           fi
+
           if [ -z "$YARN" ] || [ -z "$LOADER" ] || [ -z "$FAPI" ]; then
             echo "::error::Resolution failed: yarn='$YARN' loader='$LOADER' fabric-api='$FAPI'"
             exit 1
@@ -109,20 +118,17 @@ jobs:
 
           { echo "LOOM=$LOOM"; echo "YARN=$YARN"; echo "LOADER=$LOADER"; echo "FAPI=$FAPI"; } >> "$GITHUB_ENV"
           {
-            echo "### Strategy: $LOOM_STRATEGY (gradle ${{ matrix.gradle }})"
+            echo "### $LOOM_STRATEGY | loom=$LOOM | jdk=$JAVA_VER | gradle=$GRADLE_VER"
             echo
             echo "| item | value |"
             echo "|---|---|"
             echo "| **loom** | **$LOOM** |"
             echo "| newest stable loom | ${LOOM_NEWEST:-none} |"
-            echo "| newest 1.13.x | ${LOOM_113:-none} |"
-            echo "| newest 1.12.x | ${LOOM_112:-none} |"
-            echo "| newest 1.10.x | ${LOOM_110:-none} |"
             echo "| **yarn** | **$YARN** |"
-            echo "| **loader** | **$LOADER** |"
+            echo "| loader | $LOADER |"
             echo "| **fabric-api** | **$FAPI** |"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "Pinned: loom=$LOOM | yarn=$YARN | loader=$LOADER | fabric-api=$FAPI"
+          echo "Pinned: loom=$LOOM | yarn=$YARN | loader=$LOADER | fabric-api=$FAPI (strategy=$LOOM_STRATEGY)"
 
       - name: Build (compile + unit tests)
         id: build
@@ -135,15 +141,17 @@ jobs:
         run: |
           if [ ! -f build_log.txt ]; then echo "::error::No build log captured"; exit 0; fi
           {
-            echo "### ❌ $LOOM_STRATEGY (loom=$LOOM, fabric-api=$FAPI)"
+            echo "### ❌ $LOOM_STRATEGY (loom=$LOOM, fabric-api=$FAPI, jdk=$JAVA_VER)"
             echo
             echo '```text'
             awk '/^\* What went wrong:/{f=1} /^\* Try:/{f=0} f' build_log.txt
             grep 'Caused by:' build_log.txt | head -n 6
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
-          MIN_GRADLE="$(grep -o 'Minimum supported Gradle version is [0-9.]*' build_log.txt | head -n1 | grep -o '[0-9.]*$' || true)"
-          [ -z "$MIN_GRADLE" ] || echo "::notice::$LOOM_STRATEGY требует Gradle >= $MIN_GRADLE (стоял ${{ matrix.gradle }})"
+          MIN_LOOM="$(grep -o 'newer version of Loom ([0-9.]*)' build_log.txt | head -n1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' || true)"
+          [ -z "$MIN_LOOM" ] || echo "::notice::$LOOM_STRATEGY: Fabric API требует Loom >= $MIN_LOOM"
+          JVM_REQ="$(grep -o 'requires at least JVM runtime version [0-9]*' build_log.txt | grep -o '[0-9]*$' || true)"
+          [ -z "$JVM_REQ" ] || echo "::notice::$LOOM_STRATEGY: требуется JDK $JVM_REQ"
 
       - name: Upload mod JAR
         if: success()
