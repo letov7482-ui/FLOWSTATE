@@ -17,11 +17,11 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
-import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
 import net.fabricmc.loader.api.FabricLoader;
 
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
+import net.minecraft.util.Identifier;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -29,14 +29,16 @@ import org.slf4j.LoggerFactory;
 import java.nio.file.Path;
 
 /**
- * Entrypoint. Этап 2: измерения (кадры, тики, чанки, heap) + HUD. Ноль игровых оптимизаций.
+ * Entrypoint FLOWSTATE. Измерения (кадры, тики, чанки, heap) + HUD. Ноль игровых оптимизаций.
  *
- * ПОРЯДОК регистрации тик-обработчиков важен (все вызываются в порядке регистрации):
- *   START: (1) tickTracker.onTickStart
- *   END:   (1) tickTracker.onTickEnd  — фиксирует длительность тика
- *          (2) chunkWindow.onTickEnd  — читает её и пишет в окно
- *          (3) scheduler + хоткей     — наша собственная работа, в измерения не входит
- * Всё на одном потоке (render thread). Файловый I/O — только при старте и остановке клиента.
+ * Измерение кадров: WorldRenderEvents в текущей версии Fabric API для 1.21.11
+ * недоступен (перемещён/переработан), поэтому beginFrame() вызывается из
+ * HUD-callback (см. FlowStateHUD.register) - он срабатывает один раз за кадр,
+ * пока мир отрисован. Стоимость вызова - один nanoTime + запись в массив.
+ *
+ * ПОРЯДОК END_CLIENT_TICK: (1) tickTracker.onTickEnd -> (2) chunkWindow.onTickEnd
+ * -> (3) scheduler/hotkey. Не менять. Всё на render thread, файловый I/O - только
+ * при старте и остановке клиента.
  */
 public class FlowStateClient implements ClientModInitializer {
 
@@ -87,25 +89,21 @@ public class FlowStateClient implements ClientModInitializer {
 
         hud = new FlowStateHUD(config, monitor, analyzer, tickTracker, chunkAdvisor,
                 memoryAdvisor, System::nanoTime);
-        hud.register();
+        hud.register(); // внутри: измерение кадра (beginFrame) + отрисовка HUD
 
-        // --- Тики: порядок см. в javadoc класса ---
         ClientTickEvents.START_CLIENT_TICK.register(client -> tickTracker.onTickStart());
         ClientTickEvents.END_CLIENT_TICK.register(client -> tickTracker.onTickEnd());
-        chunkAdvisor.registerChunkEvents(); // только chunk load/unload, тики не трогает
+        chunkAdvisor.registerChunkEvents();
         ClientTickEvents.END_CLIENT_TICK.register(client ->
                 chunkWindow.onTickEnd(System.nanoTime(), tickTracker.lastTickNanos()));
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             scheduler.runDue(monitor, config.mode, TARGET_P95_MS);
             if (toggleHudKey != null && toggleHudKey.wasPressed()) {
-                config.showHud = !config.showHud; // сохранение файла — только при выходе из клиента
+                config.showHud = !config.showHud; // сохранение файла - только при выходе из клиента
             }
         });
 
         registerHudToggleKey();
-
-        // Кадры: событие начала мирового рендера — один раз за кадр, работает и при F1.
-        WorldRenderEvents.START.register(context -> monitor.beginFrame());
 
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> resetSession());
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
@@ -114,10 +112,9 @@ public class FlowStateClient implements ClientModInitializer {
             LOGGER.info("[FlowState] session start; mode={}", config.mode);
         });
 
-        // Единственная файловая запись вне старта: при завершении клиента.
         ClientLifecycleEvents.CLIENT_STOPPING.register(client -> saveConfigOnExit());
 
-        LOGGER.info("[FlowState] initialized (stage 2: monitoring + diagnostics, no gameplay optimizations)");
+        LOGGER.info("[FlowState] initialized (monitoring + diagnostics, no gameplay optimizations)");
     }
 
     private void registerSchedulerTasks() {
@@ -150,11 +147,14 @@ public class FlowStateClient implements ClientModInitializer {
     private void registerHudToggleKey() {
         if (config.hudToggleKeyCode <= 0) return;
         try {
+            // Yarn 1.21.9+: категория клавиши - KeyBinding.Category, создаётся по Identifier,
+            // а не по String. Ярлык категории - ключ lang "key.category.flowstate.main".
+            KeyBinding.Category category = KeyBinding.Category.create(Identifier.of(MOD_ID, "main"));
             toggleHudKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                     "key.flowstate.toggle_hud",
                     InputUtil.Type.KEYSYM,
                     config.hudToggleKeyCode,
-                    "category.flowstate"));
+                    category));
         } catch (RuntimeException e) {
             LOGGER.warn("[FlowState] HUD toggle key not registered: {}", e.getMessage());
         }
@@ -174,4 +174,4 @@ public class FlowStateClient implements ClientModInitializer {
         hud.reset();
         lastReportedSpikes = 0;
     }
-            }
+                }
