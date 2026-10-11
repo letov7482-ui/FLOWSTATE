@@ -1,7 +1,10 @@
 package dev.flowstate.client.hud;
 
+import dev.flowstate.client.chunks.ChunkPerformanceAdvisor;
 import dev.flowstate.client.config.FlowStateConfig;
 import dev.flowstate.client.config.PerformanceMode;
+import dev.flowstate.client.memory.MemoryPressureAdvisor;
+import dev.flowstate.client.performance.ClientTickDurationTracker;
 import dev.flowstate.client.performance.FramePacingAnalyzer;
 import dev.flowstate.client.performance.FrameTimeMonitor;
 
@@ -12,38 +15,47 @@ import net.minecraft.client.gui.DrawContext;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.LongSupplier;
 
-/**
- * HUD мода. Дешёвая отрисовка: строки пересобираются только при смене снапшота
- * статистики (по умолчанию раз в 250 мс), форматирование — не каждый кадр.
- * Все координаты — в scaled-пикселях, поэтому HUD корректен при любом GUI Scale.
- */
+/** HUD. Строки пересобираются только при новом снапшоте (~4 р/с). Масштаб GUI — любой. */
 public final class FlowStateHUD {
+
+    private static final long SIXTY_SECONDS_NANOS = 60_000_000_000L;
+    private static final long MB = 1024L * 1024L;
 
     private final FlowStateConfig config;
     private final FrameTimeMonitor monitor;
     private final FramePacingAnalyzer analyzer;
+    private final ClientTickDurationTracker tickTracker;
+    private final ChunkPerformanceAdvisor chunkAdvisor;
+    private final MemoryPressureAdvisor memoryAdvisor;
+    private final LongSupplier clock;
     private final List<String> lines = new ArrayList<>(8);
 
     private FrameTimeMonitor.Snapshot lastRendered;
     private FramePacingAnalyzer.Analysis lastAnalysis;
 
-    public FlowStateHUD(FlowStateConfig config, FrameTimeMonitor monitor, FramePacingAnalyzer analyzer) {
+    public FlowStateHUD(FlowStateConfig config, FrameTimeMonitor monitor, FramePacingAnalyzer analyzer,
+                        ClientTickDurationTracker tickTracker, ChunkPerformanceAdvisor chunkAdvisor,
+                        MemoryPressureAdvisor memoryAdvisor, LongSupplier clock) {
         this.config = config;
         this.monitor = monitor;
         this.analyzer = analyzer;
+        this.tickTracker = tickTracker;
+        this.chunkAdvisor = chunkAdvisor;
+        this.memoryAdvisor = memoryAdvisor;
+        this.clock = clock;
     }
 
     public void register() {
-        // Примечание: в свежих версиях Fabric API callback помечен deprecated.
-        // Замена (если в вашей версии он удалён) — в README, раздел "Plan B".
+        // Если в вашей версии Fabric API HudRenderCallback удалён — см. Plan B в README.
         HudRenderCallback.EVENT.register((context, tickCounter) -> render(context));
     }
 
     private void render(DrawContext context) {
         if (!config.showHud) return;
         FrameTimeMonitor.Snapshot snapshot = monitor.stats();
-        if (snapshot.totalFrames == 0) return; // ещё ничего не измерено
+        if (snapshot.totalFrames == 0) return;
 
         if (snapshot != lastRendered) {
             lastAnalysis = analyzer.analyze(snapshot);
@@ -56,15 +68,12 @@ public final class FlowStateHUD {
         TextRenderer font = client.textRenderer;
 
         int maxLineWidth = 0;
-        for (String line : lines) {
-            maxLineWidth = Math.max(maxLineWidth, font.getWidth(line));
-        }
+        for (String line : lines) maxLineWidth = Math.max(maxLineWidth, font.getWidth(line));
 
         int margin = config.hudMargin;
         int lineHeight = font.fontHeight + 1;
         context.fill(margin - 2, margin - 2,
-                margin + maxLineWidth + 4,
-                margin + lines.size() * lineHeight + 2,
+                margin + maxLineWidth + 4, margin + lines.size() * lineHeight + 2,
                 0x90101010);
 
         int y = margin;
@@ -77,7 +86,6 @@ public final class FlowStateHUD {
     private void rebuildLines(FrameTimeMonitor.Snapshot s, FramePacingAnalyzer.Analysis a) {
         lines.clear();
         if (config.mode == PerformanceMode.MAX_FPS) {
-            // MAX_FPS: минимальный объём текста, минимальная стоимость отрисовки.
             lines.add("FLOWSTATE [MAX_FPS]");
             lines.add(String.format("FPS %d | p95 %.2f ms | spikes %d", s.fps, s.p95Ms, s.spikesLast60s));
             return;
@@ -86,18 +94,22 @@ public final class FlowStateHUD {
         lines.add(String.format("FPS %d | spike %d/min", s.fps, s.spikesLast60s));
         lines.add(String.format("FT avg %.2f | med %.2f ms", s.avgMs, s.medianMs));
         lines.add(String.format("p95 %.2f | p99 %.2f ms", s.p95Ms, s.p99Ms));
-        lines.add(String.format("jitter %.2f ms", a.jitterMs));
         if (config.experimentalFeatures) {
-            lines.add(String.format("p95/med %.2f | intervals %d",
-                    Double.isNaN(a.p95ToMedianRatio) ? 0.0 : a.p95ToMedianRatio, a.spikesConsidered));
+            lines.add(String.format("jitter %.2f ms", a.jitterMs));
+            lines.add(String.format("tick avg %.2f | max %.2f ms",
+                    tickTracker.averageMs(), tickTracker.maxMs()));
+            lines.add(chunkAdvisor.summary(clock.getAsLong(), SIXTY_SECONDS_NANOS));
+            lines.add(String.format("heap %d/%d MB, trend %+.1f MB/min",
+                    memoryAdvisor.latestUsedBytes() / MB,
+                    Runtime.getRuntime().maxMemory() / MB,
+                    memoryAdvisor.trendBytesPerMinute() / MB));
             lines.add(a.note);
         }
     }
 
-    /** Сброс при выходе из мира. */
     public void reset() {
         lastRendered = null;
         lastAnalysis = null;
         lines.clear();
     }
-              }
+}
