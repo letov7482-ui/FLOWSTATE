@@ -1,0 +1,91 @@
+name: Build FLOWSTATE
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch: # кнопка "Run workflow" на странице Actions
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build & test (Fabric, Java 21)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle (with caching)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.2'
+
+      - name: Read mod version
+        run: |
+          echo "ARTIFACT_VERSION=$(grep -m1 '^mod_version=' gradle.properties | cut -d= -f2 | tr -d ' \r')" >> "$GITHUB_ENV"
+
+      # Автоматически подставляет актуальные yarn/loader/Fabric API.
+      # Если minecraft_version не существует на Fabric Meta — падение с понятным сообщением.
+      - name: Resolve & pin Fabric versions
+        run: |
+          set -euo pipefail
+          MC=$(grep -m1 '^minecraft_version=' gradle.properties | cut -d= -f2 | tr -d ' \r')
+          echo "Target Minecraft: $MC"
+
+          YARN=$(curl -fsSL -A flowstate-ci https://meta.fabricmc.net/v2/versions/yarn \
+            | jq -r --arg mc "$MC" '[.[] | select(.gameVersion == $mc)][0].version // empty')
+          if [ -z "$YARN" ]; then
+            echo "::error::Yarn mappings for Minecraft $MC not found on Fabric meta."
+            echo "Available 1.21.x game versions:"
+            curl -fsSL -A flowstate-ci https://meta.fabricmc.net/v2/versions/yarn \
+              | jq -r '[.[].gameVersion] | unique | map(select(startswith("1.21"))) | join(", ")'
+            exit 1
+          fi
+
+          LOADER=$(curl -fsSL -A flowstate-ci https://meta.fabricmc.net/v2/versions/loader \
+            | jq -r '[.[] | select(.stable == true)][0].version')
+
+          FAPI=$(curl -fsSL -A flowstate-ci "https://api.modrinth.com/v2/project/fabric-api/version" \
+            | jq -r --arg mc "$MC" '[.[] | select(.game_versions | index($mc))][0].version_number // empty') || FAPI=""
+          if [ -z "$FAPI" ]; then
+            echo "::warning::Fabric API for $MC not found on Modrinth — keeping gradle.properties value"
+          fi
+
+          sed -i "s/^yarn_mappings=.*/yarn_mappings=$YARN/" gradle.properties
+          sed -i "s/^loader_version=.*/loader_version=$LOADER/" gradle.properties
+          if [ -n "$FAPI" ]; then
+            sed -i "s/^fabric_version=.*/fabric_version=$FAPI/" gradle.properties
+          fi
+
+          echo "Pinned versions:"
+          grep -E '^(minecraft_version|yarn_mappings|loader_version|fabric_version)=' gradle.properties
+
+      - name: Build (compile + unit tests)
+        run: gradle --no-daemon build --stacktrace
+
+      - name: Upload mod JARs
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flowstate-${{ env.ARTIFACT_VERSION }}
+          path: |
+            build/libs/*.jar
+            !build/libs/*-sources.jar
+          if-no-files-found: error
+
+      - name: Upload test report (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: build/reports/tests/test/
+          if-no-files-found: ignore
