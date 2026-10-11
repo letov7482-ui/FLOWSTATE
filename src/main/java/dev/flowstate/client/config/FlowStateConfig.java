@@ -12,17 +12,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 
-/**
- * JSON-конфигурация. Безопасные значения по умолчанию, валидация,
- * восстановление после повреждённого файла (бэкап + дефолты).
- * Логика не зависит от Minecraft — покрыта юнит-тестами.
- */
+/** JSON-конфигурация: дефолты, валидация, восстановление после повреждения. */
 public final class FlowStateConfig {
 
     public static final String FILE_NAME = "flowstate.json";
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
-    // ---- Значения по умолчанию (безопасные) ----
     public boolean showHud = true;
     public PerformanceMode mode = PerformanceMode.ULTRA_SMOOTH;
     public double spikeThresholdMs = 40.0;
@@ -31,6 +26,10 @@ public final class FlowStateConfig {
     public int hudMargin = 4;
     public boolean experimentalFeatures = false;
     public boolean logSpikes = false;
+    /** Порог «медленного» клиентского тика для чанковой диагностики. */
+    public double tickSlowThresholdMs = 50.0;
+    /** GLFW-код хоткея HUD (298 = F9). 0 — хоткей отключён. */
+    public int hudToggleKeyCode = 298;
 
     public enum LoadState { LOADED, CREATED_DEFAULT, CORRUPTED_RECOVERED }
 
@@ -67,7 +66,6 @@ public final class FlowStateConfig {
         return new LoadResult(defaults, LoadState.CORRUPTED_RECOVERED, message.toString());
     }
 
-    /** @return null при успехе, описание ошибки иначе. */
     private static String backup(Path path) {
         try {
             Path backup = path.resolveSibling(path.getFileName() + ".corrupt");
@@ -78,7 +76,6 @@ public final class FlowStateConfig {
         }
     }
 
-    /** Атомарная запись через временный файл. @return null при успехе. */
     public String save(Path path) {
         try {
             Path parent = path.toAbsolutePath().getParent();
@@ -94,10 +91,6 @@ public final class FlowStateConfig {
         }
     }
 
-    /**
-     * Приводит значения к допустимым диапазонам (NaN тоже отбраковывается).
-     * @return описание исправлений или null, если всё было корректно.
-     */
     public String sanitize() {
         StringBuilder fixes = new StringBuilder();
         if (mode == null) {
@@ -108,6 +101,8 @@ public final class FlowStateConfig {
         spikeRatio = clamp(spikeRatio, 1.5, 10.0, "spikeRatio", fixes);
         statsRefreshMs = (int) clamp(statsRefreshMs, 50, 2000, "statsRefreshMs", fixes);
         hudMargin = (int) clamp(hudMargin, 0, 32, "hudMargin", fixes);
+        tickSlowThresholdMs = clamp(tickSlowThresholdMs, 10.0, 500.0, "tickSlowThresholdMs", fixes);
+        hudToggleKeyCode = (int) clamp(hudToggleKeyCode, 0, 512, "hudToggleKeyCode", fixes);
         return fixes.length() == 0 ? null : fixes.toString().trim();
     }
 
@@ -121,4 +116,4 @@ public final class FlowStateConfig {
         fixes.append(name).append('=').append(v).append("->").append(clamped).append("; ");
         return clamped;
     }
-              }
+}
