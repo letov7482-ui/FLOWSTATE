@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "flowstate",
+  "version": "${version}",
+  "name": "FLOWSTATE",
+  "description": "Client-side frame time monitoring and adaptive diagnostics. Measurements first, safe workload reduction second. No gameplay changes.",
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "dev.flowstate.client.FlowStateClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "fabric-api": "*",
+    "minecraft": ">=1.21 <1.22",
+    "java": ">=21"
+  },
+  "suggests": {
+    "sodium": "*"
+  }
+}
