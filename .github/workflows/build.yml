@@ -6,28 +6,11 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
-      loom_source:
-        description: 'Loom: reference = как в fabric-example-mod | latest | exact'
+      loom_strategy:
+        description: 'Loom: reference (как в fabric-example-mod) | snapshot (1.11-SNAPSHOT) | newest_release | loom_110'
         type: choice
-        options: [ reference, latest, exact ]
+        options: [ reference, snapshot, newest_release, loom_110 ]
         default: reference
-      loom_exact:
-        description: 'loom_source=exact: точная версия Loom, напр. 1.10.10'
-        type: string
-        default: ''
-      fabric_api_pick:
-        description: 'Fabric API для 1.21.11, если эталон не под 1.21.11'
-        type: choice
-        options: [ latest, previous ]
-        default: latest
-      gradle_version:
-        description: 'Gradle (поднять, если digest сообщит минимум)'
-        type: string
-        default: '8.14.2'
-      clean_cache:
-        description: 'Чистить Gradle-кэш перед сборкой'
-        type: boolean
-        default: true
 
 permissions:
   contents: read
@@ -36,10 +19,25 @@ jobs:
   build:
     name: Build & test (Fabric 1.21.11, Java 21)
     runs-on: ubuntu-latest
+    env:
+      LOOM_STRATEGY: ${{ inputs.loom_strategy || 'reference' }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      # Берём версию Gradle из эталонного шаблона Fabric (до setup-gradle).
+      - name: Detect reference Gradle version
+        run: |
+          set -euo pipefail
+          fetch() { curl -fsSL -A flowstate-ci "$1" 2>/dev/null || true; }
+          BRANCH="$(fetch https://api.github.com/repos/FabricMC/fabric-example-mod | jq -r '.default_branch // empty')"
+          [ -n "$BRANCH" ] || BRANCH="main"
+          echo "REF_BRANCH=$BRANCH" >> "$GITHUB_ENV"
+          GW="$(fetch "https://raw.githubusercontent.com/FabricMC/fabric-example-mod/${BRANCH}/gradle/wrapper/gradle-wrapper.properties")"
+          GV="$(printf '%s' "$GW" | grep -oE 'gradle-[0-9]+(\.[0-9]+)+' | head -n1 | sed 's/^gradle-//' || true)"
+          echo "REF_GRADLE=$GV" >> "$GITHUB_ENV"
+          echo "Reference Gradle: '${GV:-unknown}' (fallback 8.14.2)"
 
       - name: Set up JDK 21 (Temurin)
         uses: actions/setup-java@v4
@@ -50,12 +48,12 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '${{ inputs.gradle_version || ''8.14.2'' }}'
+          gradle-version: ${{ env.REF_GRADLE || '8.14.2' }}
 
+      # Отладочный режим: чистый кэш убирает последствия оборванных запусков.
       - name: Clean Gradle caches
-        if: ${{ inputs.clean_cache == true || github.event_name == 'push' }}
         run: |
-          echo "Wiping ~/.gradle/caches"
+          echo "Wiping ~/.gradle/caches (debug mode)"
           rm -rf ~/.gradle/caches
 
       - name: Read mod version
@@ -64,93 +62,15 @@ jobs:
           [ -n "$V" ] || V="0.1.0"
           echo "ARTIFACT_VERSION=$V" >> "$GITHUB_ENV"
 
-      - name: List available Loom releases
-        run: |
-          fetch() { curl -fsSL -A flowstate-ci "$1" 2>/dev/null || true; }
-          META="$(fetch https://maven.fabricmc.net/net/fabricmc/fabric-loom/maven-metadata.xml)"
-          if [ -n "$META" ]; then
-            echo "Newest stable Loom releases on maven.fabricmc.net:"
-            printf '%s' "$META" | grep -o '<version>[^<]*</version>' | sed 's/<[^>]*>//g' \
-              | grep -viE 'SNAPSHOT|alpha|beta|pre|rc' | sort -V | tail -n 10 | sed 's/^/  /' || true
-          else
-            echo "::warning::Could not fetch Loom metadata (non-fatal)"
-          fi
-
-      - name: Fetch reference combo (fabric-example-mod)
+      # Единый шаг подготовки. НИ ОДНОГО ${{ }} внутри — только env и вычисления.
+      - name: Prepare versions (loom, yarn, loader, fabric-api)
         run: |
           set -euo pipefail
-          UA="flowstate-ci"
-          BRANCH="$(curl -fsSL -A "$UA" https://api.github.com/repos/FabricMC/fabric-example-mod 2>/dev/null \
-            | jq -r '.default_branch // empty' || true)"
-          if [ -z "$BRANCH" ]; then
-            echo "::warning::Cannot fetch fabric-example-mod metadata"
-            { echo "REF_BRANCH="; echo "LOOM_REF="; echo "REF_MC="; echo "REF_YARN="; echo "REF_LOADER="; echo "REF_FAPI="; } >> "$GITHUB_ENV"
-            exit 0
-          fi
-          BG="$(curl -fsSL -A "$UA" "https://raw.githubusercontent.com/FabricMC/fabric-example-mod/${BRANCH}/build.gradle" 2>/dev/null || true)"
-          GP="$(curl -fsSL -A "$UA" "https://raw.githubusercontent.com/FabricMC/fabric-example-mod/${BRANCH}/gradle.properties" 2>/dev/null || true)"
-          LOOM_REF="$(printf '%s' "$BG" | grep -oE "fabric-loom['\"] *version *['\"][^'\"]+" | head -n1 | sed "s/.*['\"] *version *['\"]//" || true)"
-          get_ref() { printf '%s' "$GP" | grep -m1 "^$1=" | cut -d= -f2- | tr -d '[:space:]\r' || true; }
-          REF_MC="$(get_ref minecraft_version)"
-          REF_YARN="$(get_ref yarn_mappings)"
-          REF_LOADER="$(get_ref loader_version)"
-          REF_FAPI="$(get_ref fabric_version)"
-          {
-            echo "REF_BRANCH=$BRANCH"
-            echo "LOOM_REF=$LOOM_REF"
-            echo "REF_MC=$REF_MC"
-            echo "REF_YARN=$REF_YARN"
-            echo "REF_LOADER=$REF_LOADER"
-            echo "REF_FAPI=$REF_FAPI"
-          } >> "$GITHUB_ENV"
-          echo "=== Reference: fabric-example-mod @ $BRANCH ==="
-          echo "mc=$REF_MC | yarn=$REF_YARN | loader=$REF_LOADER | fabric-api=$REF_FAPI | loom=$LOOM_REF"
-
-      - name: Resolve Loom version
-        run: |
-          set -euo pipefail
-          fetch() { curl -fsSL -A flowstate-ci "$1" 2>/dev/null || true; }
-          valid() { printf '%s' "$1" | grep -qE '^[0-9]+(\.[0-9]+)+(-SNAPSHOT)?$'; }
-
-          SRC="${{ inputs.loom_source || 'reference' }}"
-          LOOM=""
-          case "$SRC" in
-            reference)
-              LOOM="${LOOM_REF:-}"
-              if [ -z "$LOOM" ]; then
-                echo "::warning::No Loom version in reference; falling back to 1.11-SNAPSHOT"
-                LOOM="1.11-SNAPSHOT"
-              fi
-              ;;
-            latest)
-              META="$(fetch https://maven.fabricmc.net/net/fabricmc/fabric-loom/maven-metadata.xml)"
-              CAND="$(printf '%s' "$META" | grep -o '<version>[^<]*</version>' | sed 's/<[^>]*>//g' \
-                | grep -viE 'SNAPSHOT|alpha|beta|pre|rc' | sort -V | tail -n 1 || true)"
-              if valid "$CAND"; then LOOM="$CAND"; else LOOM="1.11.8"; echo "::warning::Detection failed; using 1.11.8"; fi
-              ;;
-            exact)
-              LOOM="${{ inputs.loom_exact }}"
-              ;;
-          esac
-          if ! valid "$LOOM"; then
-            echo "::error::Invalid Loom version: '$LOOM'"
-            exit 1
-          fi
-          sed -i "s/id 'fabric-loom' version '[^']*'/id 'fabric-loom' version '$LOOM'/" build.gradle
-          grep -n "fabric-loom" build.gradle
-          echo "LOOM=$LOOM" >> "$GITHUB_ENV"
-          echo "Using Loom $LOOM (source: $SRC)"
-
-      - name: Resolve & pin Fabric versions (strict 1.21.11)
-        run: |
-          set -euo pipefail
+          UA="flowstate-ci (+https://github.com)"
           REQUIRED_MC="1.21.11"
-          UA="flowstate-ci"
-          PICK="${{ inputs.fabric_api_pick || 'latest' }}"
-
-          read_prop() {
-            grep -m1 "^$1=" gradle.properties | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '[:space:]\r'
-          }
+          fetch() { curl -fsSL -A "$UA" "$1" 2>/dev/null || true; }
+          valid_loom() { printf '%s' "$1" | grep -qE '^[0-9]+(\.[0-9]+)+(-SNAPSHOT)?$'; }
+          read_prop() { grep -m1 "^$1=" gradle.properties | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '[:space:]\r'; }
 
           MC="$(read_prop minecraft_version)"
           if [ "$MC" != "$REQUIRED_MC" ]; then
@@ -158,44 +78,95 @@ jobs:
             exit 1
           fi
 
-          if [ "${REF_MC:-}" = "$REQUIRED_MC" ] && [ -n "${REF_YARN:-}" ] && [ -n "${REF_FAPI:-}" ]; then
-            echo "Reference also targets $REQUIRED_MC — adopting its validated combo"
-            YARN="$REF_YARN"; LOADER="${REF_LOADER:-}"; FAPI="$REF_FAPI"
-          else
-            echo "Reference MC='${REF_MC:-?}' != $REQUIRED_MC — resolving our own versions"
-            YARN="$(curl -fsSL -A "$UA" https://meta.fabricmc.net/v2/versions/yarn \
-              | jq -r --arg mc "$MC" '[.[] | select(.gameVersion == $mc)][0].version // empty')"
-            LOADER="$(curl -fsSL -A "$UA" https://meta.fabricmc.net/v2/versions/loader \
-              | jq -r '[.[] | select(.stable == true)][0].version')"
-            VERSIONS_JSON="$(curl -fsSL -A "$UA" \
-              "https://api.modrinth.com/v2/project/fabric-api/version?game_versions=%5B%22${MC}%22%5D&loaders=%5B%22fabric%22%5D")"
-            if [ "$PICK" = "previous" ]; then
-              FAPI="$(printf '%s' "$VERSIONS_JSON" | jq -r '.[1].version_number // empty')"
-              [ -n "$FAPI" ] || FAPI="$(printf '%s' "$VERSIONS_JSON" | jq -r '.[0].version_number // empty')"
-            else
-              FAPI="$(printf '%s' "$VERSIONS_JSON" | jq -r '.[0].version_number // empty')"
-            fi
-            if [ -z "$FAPI" ]; then
-              FAPI="$(curl -fsSL -A "$UA" https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml \
-                | grep -o "<version>[^<]*+${MC}</version>" | sed 's/<[^>]*>//g' | sort -V | tail -n1 || true)"
-            fi
-          fi
+          # ---- Эталон: fabric-example-mod ----
+          BRANCH="${REF_BRANCH:-main}"
+          BG="$(fetch "https://raw.githubusercontent.com/FabricMC/fabric-example-mod/${BRANCH}/build.gradle")"
+          GP="$(fetch "https://raw.githubusercontent.com/FabricMC/fabric-example-mod/${BRANCH}/gradle.properties")"
+          LOOM_REF="$(printf '%s' "$BG" | grep -oE "fabric-loom['\"] *version *['\"][^'\"]+" | head -n1 | sed "s/.*version *['\"]//" || true)"
+          get_ref() { printf '%s' "$GP" | grep -m1 "^$1=" | cut -d= -f2- | tr -d '[:space:]\r' || true; }
+          REF_MC="$(get_ref minecraft_version)"
+          REF_YARN="$(get_ref yarn_mappings)"
+          REF_LOADER="$(get_ref loader_version)"
+          REF_FAPI="$(get_ref fabric_version)"
 
-          if [ -z "$YARN" ] || [ -z "$FAPI" ]; then
-            echo "::error::Resolution failed: yarn='$YARN' fabric-api='$FAPI'"
-            exit 1
+          # ---- Кандидаты Loom из maven-метаданных ----
+          META="$(fetch https://maven.fabricmc.net/net/fabricmc/fabric-loom/maven-metadata.xml)"
+          LOOM_ALL="$(printf '%s' "$META" | grep -o '<version>[^<]*</version>' | sed 's/<[^>]*>//g' || true)"
+          LOOM_TOP10="$(printf '%s\n' "$LOOM_ALL" | grep -viE 'SNAPSHOT|alpha|beta|pre|rc' | sort -V | tail -n 10 || true)"
+          LOOM_NEWEST="$(printf '%s\n' "$LOOM_TOP10" | tail -n 1 || true)"
+          LOOM_110="$(printf '%s\n' "$LOOM_ALL" | grep -E '^1\.10\.' | grep -viE 'SNAPSHOT|alpha|beta|pre|rc' | sort -V | tail -n 1 || true)"
+
+          # ---- Выбор Loom. Никогда не exit 1: цепочка заканчивается проверенной 1.11-SNAPSHOT ----
+          LOOM=""
+          case "$LOOM_STRATEGY" in
+            snapshot)       LOOM="1.11-SNAPSHOT" ;;
+            newest_release) LOOM="$LOOM_NEWEST" ;;
+            loom_110)       LOOM="$LOOM_110" ;;
+            *)              LOOM="$LOOM_REF" ;;
+          esac
+          valid_loom "$LOOM" || LOOM=""
+          if [ -z "$LOOM" ]; then
+            if [ -n "$LOOM_REF" ] && valid_loom "$LOOM_REF"; then
+              LOOM="$LOOM_REF"
+            else
+              LOOM="1.11-SNAPSHOT"
+            fi
+            echo "::warning::Strategy '$LOOM_STRATEGY' gave no valid Loom; fallback: $LOOM"
+          fi
+          sed -i "s/id 'fabric-loom' version '[^']*'/id 'fabric-loom' version '$LOOM'/" build.gradle
+
+          # ---- Yarn / Loader / Fabric API ----
+          if [ "$REF_MC" = "$REQUIRED_MC" ] && [ -n "$REF_YARN" ] && [ -n "$REF_FAPI" ]; then
+            echo "Reference targets $REQUIRED_MC -> adopting its validated combo"
+            YARN="$REF_YARN"; LOADER="$REF_LOADER"; FAPI="$REF_FAPI"
+          else
+            echo "Reference mc='${REF_MC:-?}' != $REQUIRED_MC -> resolving ourselves"
+            YARN="$(fetch https://meta.fabricmc.net/v2/versions/yarn | jq -r --arg mc "$MC" '[.[] | select(.gameVersion == $mc)][0].version // empty')"
+            VJ="$(fetch "https://api.modrinth.com/v2/project/fabric-api/version?game_versions=%5B%22${MC}%22%5D&loaders=%5B%22fabric%22%5D")"
+            FAPI="$(printf '%s' "$VJ" | jq -r '.[0].version_number // empty')"
+            if [ -z "$FAPI" ]; then
+              FAPI="$(fetch https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml \
+                | grep -o "<version>[^<]*+${MC}</version>" | sed 's/<[^>]*>//g' | sort -V | tail -n1)"
+            fi
           fi
           if [ -z "${LOADER:-}" ]; then
-            LOADER="$(curl -fsSL -A "$UA" https://meta.fabricmc.net/v2/versions/loader \
-              | jq -r '[.[] | select(.stable == true)][0].version')"
+            LOADER="$(fetch https://meta.fabricmc.net/v2/versions/loader | jq -r '[.[] | select(.stable == true)][0].version')"
+          fi
+          if [ -z "$YARN" ] || [ -z "$LOADER" ] || [ -z "$FAPI" ]; then
+            echo "::error::Resolution failed: yarn='$YARN' loader='$LOADER' fabric-api='$FAPI'"
+            exit 1
           fi
 
           sed -i "s/^yarn_mappings=.*/yarn_mappings=$YARN/" gradle.properties
           sed -i "s/^loader_version=.*/loader_version=$LOADER/" gradle.properties
           sed -i "s/^fabric_version=.*/fabric_version=$FAPI/" gradle.properties
 
-          { echo "YARN=$YARN"; echo "LOADER=$LOADER"; echo "FAPI=$FAPI"; } >> "$GITHUB_ENV"
-          echo "Pinned: loom=${LOOM} | yarn=$YARN | loader=$LOADER | fabric-api=$FAPI"
+          { echo "LOOM=$LOOM"; echo "YARN=$YARN"; echo "LOADER=$LOADER"; echo "FAPI=$FAPI"; } >> "$GITHUB_ENV"
+
+          # Полный отчёт запуска — всегда, на вкладку Summary. Без обратных кавычек в строках.
+          {
+            echo "## FLOWSTATE run report"
+            echo
+            echo "| item | value |"
+            echo "|---|---|"
+            echo "| loom strategy | $LOOM_STRATEGY |"
+            echo "| **loom** | **$LOOM** |"
+            echo "| reference (example-mod @$BRANCH) | mc=$REF_MC, loom=$LOOM_REF, gradle=${REF_GRADLE:-unknown} |"
+            echo "| newest stable loom | $LOOM_NEWEST |"
+            echo "| newest 1.10.x loom | ${LOOM_110:-none} |"
+            echo "| **yarn** | **$YARN** |"
+            echo "| loader | $LOADER |"
+            echo "| **fabric-api** | **$FAPI** |"
+            echo
+            echo "<details><summary>Top-10 stable Loom releases</summary>"
+            echo
+            echo '```'
+            printf '%s\n' "$LOOM_TOP10"
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Pinned: loom=$LOOM | yarn=$YARN | loader=$LOADER | fabric-api=$FAPI (strategy=$LOOM_STRATEGY)"
 
       - name: Build (compile + unit tests)
         id: build
@@ -208,9 +179,9 @@ jobs:
         run: |
           if [ ! -f build_log.txt ]; then echo "::error::No build log captured"; exit 0; fi
           {
-            echo "## 🔎 FLOWSTATE failure digest"
+            echo "## Failure digest"
             echo
-            echo "loom=${LOOM} | fabric-api=${FAPI} | gradle=${{ inputs.gradle_version || '8.14.2' }} | ref(mc=${REF_MC}, loom=${LOOM_REF})"
+            echo "loom=$LOOM | fabric-api=$FAPI | strategy=$LOOM_STRATEGY | gradle=${REF_GRADLE:-8.14.2}"
             echo
             echo '```text'
             awk '/^\* What went wrong:/{f=1} /^\* Try:/{f=0} f' build_log.txt
@@ -221,14 +192,9 @@ jobs:
           awk '/^\* What went wrong:/{f=1} /^\* Try:/{f=0} f' build_log.txt || true
           grep 'Caused by:' build_log.txt | head -n 5 || true
           MIN_GRADLE="$(grep -o 'Minimum supported Gradle version is [0-9.]*' build_log.txt | head -n1 | grep -o '[0-9.]*$' || true)"
-          if [ -n "$MIN_GRADLE" ]; then
-            echo "::notice::Loom требует Gradle >= ${MIN_GRADLE}. Перезапустите с gradle_version=${MIN_GRADLE}."
-          fi
+          [ -z "$MIN_GRADLE" ] || echo "::notice::Loom требует Gradle >= $MIN_GRADLE — версия уже берётся из эталона, проверьте шаг Detect reference Gradle version."
           if grep -q "Javadoc provided by mod" build_log.txt 2>/dev/null; then
-            echo "::error::Javadoc validation still failing. Next moves:"
-            echo "::error::1) Run with loom_source=latest (newer Loom may fix/skip this)"
-            echo "::error::2) If that fails: take newest 1.10.x from 'List available Loom releases' output and run with loom_source=exact (Loom 1.10 has no javadoc processor - hypothesis)"
-            echo "::error::3) Consider upstream issue at https://github.com/FabricMC/fabric-loom/issues"
+            echo "::error::Javadoc remap failure again. Если strategy=reference — перезапустите с loom_strategy=loom_110 (гипотеза: в 1.10.x нет javadoc-процессора). Если strategy=loom_110 — попробуйте newest_release."
           fi
 
       - name: Upload mod JARs
