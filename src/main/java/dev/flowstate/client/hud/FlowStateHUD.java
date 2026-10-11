@@ -17,7 +17,12 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.function.LongSupplier;
 
-/** HUD. Строки пересобираются только при новом снапшоте (~4 р/с). Масштаб GUI — любой. */
+/**
+ * HUD + измерение кадров. Callback срабатывает один раз за кадр, пока мир отрисован:
+ * сначала beginFrame() (всегда, даже когда наш HUD скрыт), затем отрисовка по настройке.
+ * Честное ограничение: если vanilla прячет HUD (F1) так, что callback не вызывается,
+ * кадры в этот период не измеряются - статистика не портится благодаря отсечке пауз.
+ */
 public final class FlowStateHUD {
 
     private static final long SIXTY_SECONDS_NANOS = 60_000_000_000L;
@@ -47,13 +52,15 @@ public final class FlowStateHUD {
         this.clock = clock;
     }
 
+    @SuppressWarnings("deprecation")
     public void register() {
-        // Если в вашей версии Fabric API HudRenderCallback удалён — см. Plan B в README.
-        HudRenderCallback.EVENT.register((context, tickCounter) -> render(context));
+        HudRenderCallback.EVENT.register((context, tickCounter) -> {
+            monitor.beginFrame();
+            if (config.showHud) render(context);
+        });
     }
 
     private void render(DrawContext context) {
-        if (!config.showHud) return;
         FrameTimeMonitor.Snapshot snapshot = monitor.stats();
         if (snapshot.totalFrames == 0) return;
 
