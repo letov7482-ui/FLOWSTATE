@@ -5,6 +5,20 @@ on:
     branches: [ main, master ]
   pull_request:
   workflow_dispatch:
+    inputs:
+      fabric_api_pick:
+        description: 'Fabric API build for 1.21.11: latest or previous'
+        type: choice
+        options: [ latest, previous ]
+        default: latest
+      loom_version:
+        description: 'Loom: "latest" (auto-detect) or exact version, e.g. 1.10.5'
+        type: string
+        default: latest
+      clean_cache:
+        description: 'Wipe Gradle caches before build (fixes corrupted downloads)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -29,54 +43,85 @@ jobs:
         with:
           gradle-version: '8.14.2'
 
+      - name: Clean Gradle caches (manual opt-in)
+        if: inputs.clean_cache == true
+        run: |
+          echo "Wiping ~/.gradle/caches as requested"
+          rm -rf ~/.gradle/caches
+
       - name: Read mod version
         run: |
           echo "ARTIFACT_VERSION=$(grep -m1 '^mod_version=' gradle.properties | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '[:space:]\r')" >> "$GITHUB_ENV"
+
+      - name: Resolve Loom version
+        run: |
+          set -euo pipefail
+          REQ="${{ inputs.loom_version || 'latest' }}"
+          if [ "$REQ" = "latest" ]; then
+            LOOM=""
+            META=$(curl -fsSL -A flowstate-ci https://maven.fabricmc.net/fabric-loom/fabric-loom.gradle.plugin/maven-metadata.xml || true)
+            if [ -n "$META" ]; then
+              LOOM=$(printf '%s' "$META" | grep -o '<release>[^<]*</release>' | head -n1 | sed 's/<[^>]*>//g')
+            fi
+            # Подстраховка: <release> должен быть нормальной версией вида 1.12.3
+            if ! printf '%s' "$LOOM" | grep -qE '^[0-9]+(\.[0-9]+)+$'; then
+              echo "Falling back to full version list..."
+              META=$(curl -fsSL -A flowstate-ci https://maven.fabricmc.net/fabric-loom/fabric-loom/maven-metadata.xml)
+              LOOM=$(printf '%s' "$META" | grep -o '<version>[^<]*</version>' | sed 's/<[^>]*>//g' \
+                | grep -viE 'SNAPSHOT|alpha|beta|pre|rc' | sort -V | tail -n1)
+            fi
+          else
+            LOOM="$REQ"
+          fi
+          echo "Using Loom $LOOM"
+          sed -i "s/id 'fabric-loom' version '[^']*'/id 'fabric-loom' version '$LOOM'/" build.gradle
+          echo "LOOM=$LOOM" >> "$GITHUB_ENV"
 
       - name: Resolve & pin Fabric versions (strict 1.21.11)
         run: |
           set -euo pipefail
           REQUIRED_MC="1.21.11"
           UA="flowstate-ci (+https://github.com)"
+          PICK="${{ inputs.fabric_api_pick || 'latest' }}"
 
-          # Читаем значение, зачищая случайные встроенные комментарии
           read_prop() {
             grep -m1 "^$1=" gradle.properties | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '[:space:]\r'
           }
 
           MC="$(read_prop minecraft_version)"
-          echo "gradle.properties: minecraft_version='$MC'"
           if [ "$MC" != "$REQUIRED_MC" ]; then
-            echo "::error::FLOWSTATE targets Minecraft $REQUIRED_MC strictly, but gradle.properties has '$MC'."
+            echo "::error::FLOWSTATE targets $REQUIRED_MC strictly, gradle.properties has '$MC'"
             exit 1
           fi
-          echo "MC=$MC" >> "$GITHUB_ENV"
 
           YARN_JSON="$(curl -fsSL -A "$UA" https://meta.fabricmc.net/v2/versions/yarn)"
           YARN="$(printf '%s' "$YARN_JSON" | jq -r --arg mc "$MC" '[.[] | select(.gameVersion == $mc)][0].version // empty')"
           if [ -z "$YARN" ]; then
-            echo "::error::No Yarn mappings for $MC on Fabric meta."
+            echo "::error::No Yarn mappings for $MC."
             exit 1
           fi
 
           LOADER_JSON="$(curl -fsSL -A "$UA" https://meta.fabricmc.net/v2/versions/loader)"
           LOADER="$(printf '%s' "$LOADER_JSON" | jq -r '[.[] | select(.stable == true)][0].version')"
-          if [ -z "$LOADER" ]; then
-            echo "::error::No stable Fabric Loader version on meta."
-            exit 1
-          fi
 
-          # Fabric API: источник 1 - Modrinth, источник 2 - maven.fabricmc.net
-          FAPI="$(curl -fsSL -A "$UA" \
-            "https://api.modrinth.com/v2/project/fabric-api/version?game_versions=%5B%22${MC}%22%5D&loaders=%5B%22fabric%22%5D" \
-            | jq -r '.[0].version_number // empty' || true)"
-          if [ -z "$FAPI" ]; then
-            echo "Modrinth has no Fabric API for $MC, trying maven.fabricmc.net..."
-            FAPI="$(curl -fsSL -A "$UA" https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml \
-              | grep -o "<version>[^<]*+${MC}</version>" | sed 's/<[^>]*>//g' | sort -V | tail -n 1 || true)"
+          VERSIONS_JSON="$(curl -fsSL -A "$UA" \
+            "https://api.modrinth.com/v2/project/fabric-api/version?game_versions=%5B%22${MC}%22%5D&loaders=%5B%22fabric%22%5D")"
+          if [ "$PICK" = "previous" ]; then
+            FAPI="$(printf '%s' "$VERSIONS_JSON" | jq -r '.[1].version_number // empty')"
+            if [ -z "$FAPI" ]; then
+              echo "::warning::Only one Fabric API build for $MC exists; using latest"
+              FAPI="$(printf '%s' "$VERSIONS_JSON" | jq -r '.[0].version_number // empty')"
+            fi
+          else
+            FAPI="$(printf '%s' "$VERSIONS_JSON" | jq -r '.[0].version_number // empty')"
           fi
           if [ -z "$FAPI" ]; then
-            echo "::error::No Fabric API build for $MC found (checked Modrinth and maven.fabricmc.net)."
+            echo "Modrinth lookup failed, trying maven.fabricmc.net..."
+            FAPI="$(curl -fsSL -A "$UA" https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml \
+              | grep -o "<version>[^<]*+${MC}</version>" | sed 's/<[^>]*>//g' | sort -V | tail -n1 || true)"
+          fi
+          if [ -z "$FAPI" ]; then
+            echo "::error::No Fabric API build for $MC found."
             exit 1
           fi
 
@@ -85,14 +130,28 @@ jobs:
           sed -i "s/^fabric_version=.*/fabric_version=$FAPI/" gradle.properties
 
           {
-            echo "YARN=$YARN"
-            echo "LOADER=$LOADER"
-            echo "FAPI=$FAPI"
+            echo "YARN=$YARN"; echo "LOADER=$LOADER"; echo "FAPI=$FAPI"
           } >> "$GITHUB_ENV"
-          echo "Pinned: minecraft=$MC | yarn=$YARN | loader=$LOADER | fabric-api=$FAPI"
+          echo "Pinned: loom=$LOOM | yarn=$YARN | loader=$LOADER | fabric-api=$FAPI (pick=$PICK)"
 
       - name: Build (compile + unit tests)
-        run: gradle --no-daemon build --stacktrace
+        id: build
+        run: |
+          set -o pipefail
+          gradle --no-daemon build --stacktrace 2>&1 | tee build_log.txt
+
+      - name: Diagnose known failure modes
+        if: failure() && steps.build.outcome == 'failure'
+        run: |
+          if grep -q "Javadoc provided by mod" build_log.txt 2>/dev/null; then
+            echo "::error::Loom javadoc remapping failure detected. Workarounds, in order:"
+            echo "::error::1) Re-run with clean_cache=true"
+            echo "::error::2) Re-run with fabric_api_pick=previous"
+            echo "::error::3) Re-run with loom_version=<a 1.10.x release from https://maven.fabricmc.net/fabric-loom/fabric-loom.gradle.plugin/maven-metadata.xml>"
+            echo "::error::4) Search https://github.com/FabricMC/fabric-loom/issues for: Javadoc provided by mod must be have an intermediary source namespace"
+          else
+            echo "::error::Build failed for a different reason - open the Build step log"
+          fi
 
       - name: Upload mod JARs
         if: success()
