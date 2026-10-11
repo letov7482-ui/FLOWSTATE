@@ -12,7 +12,7 @@ on:
         options: [ latest, previous ]
         default: latest
       loom_version:
-        description: 'Loom: "latest" (auto-detect) or exact version, e.g. 1.10.5'
+        description: 'Loom: "latest" (auto-detect) or exact version, e.g. 1.11.8'
         type: string
         default: latest
       clean_cache:
@@ -53,28 +53,58 @@ jobs:
         run: |
           echo "ARTIFACT_VERSION=$(grep -m1 '^mod_version=' gradle.properties | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '[:space:]\r')" >> "$GITHUB_ENV"
 
+      # Детекция версии Loom НЕ МОЖЕТ уронить workflow:
+      # каждый curl защищён, любая неудача завершается известной рабочей версией.
       - name: Resolve Loom version
         run: |
           set -euo pipefail
+          fetch() { curl -fsSL -A flowstate-ci "$1" 2>/dev/null || true; }
+          valid() { printf '%s' "$1" | grep -qE '^[0-9]+(\.[0-9]+)+$'; }
+
           REQ="${{ inputs.loom_version || 'latest' }}"
-          if [ "$REQ" = "latest" ]; then
-            LOOM=""
-            META=$(curl -fsSL -A flowstate-ci https://maven.fabricmc.net/fabric-loom/fabric-loom.gradle.plugin/maven-metadata.xml || true)
-            if [ -n "$META" ]; then
-              LOOM=$(printf '%s' "$META" | grep -o '<release>[^<]*</release>' | head -n1 | sed 's/<[^>]*>//g')
-            fi
-            # Подстраховка: <release> должен быть нормальной версией вида 1.12.3
-            if ! printf '%s' "$LOOM" | grep -qE '^[0-9]+(\.[0-9]+)+$'; then
-              echo "Falling back to full version list..."
-              META=$(curl -fsSL -A flowstate-ci https://maven.fabricmc.net/fabric-loom/fabric-loom/maven-metadata.xml)
-              LOOM=$(printf '%s' "$META" | grep -o '<version>[^<]*</version>' | sed 's/<[^>]*>//g' \
-                | grep -viE 'SNAPSHOT|alpha|beta|pre|rc' | sort -V | tail -n1)
-            fi
-          else
+          LOOM=""
+          if [ "$REQ" != "latest" ]; then
             LOOM="$REQ"
+            echo "Loom pinned manually: $LOOM"
+          else
+            # Источник 1 (правильные координаты артефакта): net.fabricmc:fabric-loom
+            META="$(fetch https://maven.fabricmc.net/net/fabricmc/fabric-loom/maven-metadata.xml)"
+            if [ -n "$META" ]; then
+              RELEASES="$(printf '%s' "$META" | grep -o '<version>[^<]*</version>' \
+                | sed 's/<[^>]*>//g' | grep -viE 'SNAPSHOT|alpha|beta|pre|rc' || true)"
+              if [ -n "$RELEASES" ]; then
+                printf '%s\n' "$RELEASES" | sort -V | tail -n 5 | sed 's/^/  loom candidate: /'
+                LOOM="$(printf '%s\n' "$RELEASES" | sort -V | tail -n 1)"
+                echo "Detected newest Loom release: $LOOM"
+              fi
+            else
+              echo "net.fabricmc:fabric-loom metadata unavailable - trying plugin marker"
+            fi
+            # Источник 2 (резерв): marker-артефакт плагина
+            if ! valid "$LOOM"; then
+              META="$(fetch https://maven.fabricmc.net/fabric-loom/fabric-loom.gradle.plugin/maven-metadata.xml)"
+              if [ -n "$META" ]; then
+                CAND="$(printf '%s' "$META" | grep -o '<release>[^<]*</release>' | head -n1 | sed 's/<[^>]*>//g' || true)"
+                if valid "$CAND"; then
+                  echo "Detected via plugin marker: $CAND"
+                  LOOM="$CAND"
+                fi
+              fi
+            fi
+            # Источник 3 (гарантия): версия, существование которой доказано логом CI №6
+            if ! valid "$LOOM"; then
+              LOOM="1.11.8"
+              echo "::warning::Auto-detect failed, using known-good Loom 1.11.8"
+            fi
           fi
+          if ! valid "$LOOM"; then
+            echo "::error::Invalid loom_version input: '$LOOM'"
+            exit 1
+          fi
+
           echo "Using Loom $LOOM"
           sed -i "s/id 'fabric-loom' version '[^']*'/id 'fabric-loom' version '$LOOM'/" build.gradle
+          grep -n "fabric-loom" build.gradle | sed 's/^/  build.gradle: /'
           echo "LOOM=$LOOM" >> "$GITHUB_ENV"
 
       - name: Resolve & pin Fabric versions (strict 1.21.11)
@@ -132,7 +162,7 @@ jobs:
           {
             echo "YARN=$YARN"; echo "LOADER=$LOADER"; echo "FAPI=$FAPI"
           } >> "$GITHUB_ENV"
-          echo "Pinned: loom=$LOOM | yarn=$YARN | loader=$LOADER | fabric-api=$FAPI (pick=$PICK)"
+          echo "Pinned: loom=${LOOM} | yarn=$YARN | loader=$LOADER | fabric-api=$FAPI (pick=$PICK)"
 
       - name: Build (compile + unit tests)
         id: build
@@ -144,11 +174,10 @@ jobs:
         if: failure() && steps.build.outcome == 'failure'
         run: |
           if grep -q "Javadoc provided by mod" build_log.txt 2>/dev/null; then
-            echo "::error::Loom javadoc remapping failure detected. Workarounds, in order:"
+            echo "::error::Loom javadoc remapping failure. Try in this order:"
             echo "::error::1) Re-run with clean_cache=true"
             echo "::error::2) Re-run with fabric_api_pick=previous"
-            echo "::error::3) Re-run with loom_version=<a 1.10.x release from https://maven.fabricmc.net/fabric-loom/fabric-loom.gradle.plugin/maven-metadata.xml>"
-            echo "::error::4) Search https://github.com/FabricMC/fabric-loom/issues for: Javadoc provided by mod must be have an intermediary source namespace"
+            echo "::error::3) Re-run with loom_version set to a DIFFERENT release (see 'loom candidate:' lines in the Resolve step log of any default run)"
           else
             echo "::error::Build failed for a different reason - open the Build step log"
           fi
