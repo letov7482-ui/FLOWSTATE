@@ -6,19 +6,23 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      loom_version:
+        description: 'Loom: 1.11.8 (known-good) | latest | точная версия'
+        type: string
+        default: '1.11.8'
       fabric_api_pick:
-        description: 'Fabric API build for 1.21.11: latest or previous'
+        description: 'Fabric API для 1.21.11 (previous = обход сломанного javadoc)'
         type: choice
         options: [ latest, previous ]
-        default: latest
-      loom_version:
-        description: 'Loom: "latest" (auto-detect) or exact version, e.g. 1.11.8'
-        type: string
-        default: latest
+        default: previous
       clean_cache:
-        description: 'Wipe Gradle caches before build (fixes corrupted downloads)'
+        description: 'Чистить Gradle-кэш перед сборкой'
         type: boolean
-        default: false
+        default: true
+      gradle_version:
+        description: 'Gradle (менять только если digest явно попросит)'
+        type: string
+        default: '8.14.2'
 
 permissions:
   contents: read
@@ -38,81 +42,74 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Set up Gradle (with caching)
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.14.2'
+          gradle-version: '${{ inputs.gradle_version || ''8.14.2'' }}'
 
-      - name: Clean Gradle caches (manual opt-in)
-        if: inputs.clean_cache == true
+      # На push тоже чистим: на этапе отладки это убирает лишнюю переменную.
+      - name: Clean Gradle caches
+        if: ${{ inputs.clean_cache == true || github.event_name == 'push' }}
         run: |
-          echo "Wiping ~/.gradle/caches as requested"
+          echo "Wiping ~/.gradle/caches"
           rm -rf ~/.gradle/caches
 
       - name: Read mod version
         run: |
-          echo "ARTIFACT_VERSION=$(grep -m1 '^mod_version=' gradle.properties | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '[:space:]\r')" >> "$GITHUB_ENV"
+          V="$(grep -m1 '^mod_version=' gradle.properties | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '[:space:]\r')"
+          [ -n "$V" ] || V="0.1.0"
+          echo "ARTIFACT_VERSION=$V" >> "$GITHUB_ENV"
 
-      # Детекция версии Loom НЕ МОЖЕТ уронить workflow:
-      # каждый curl защищён, любая неудача завершается известной рабочей версией.
+      # Показываем доступные версии Loom в КАЖДОМ запуске — чтобы выбор был из фактов.
+      - name: List available Loom releases
+        run: |
+          fetch() { curl -fsSL -A flowstate-ci "$1" 2>/dev/null || true; }
+          META="$(fetch https://maven.fabricmc.net/net/fabricmc/fabric-loom/maven-metadata.xml)"
+          if [ -n "$META" ]; then
+            echo "Newest stable Loom releases on maven.fabricmc.net:"
+            printf '%s' "$META" | grep -o '<version>[^<]*</version>' | sed 's/<[^>]*>//g' \
+              | grep -viE 'SNAPSHOT|alpha|beta|pre|rc' | sort -V | tail -n 10 | sed 's/^/  /' || true
+          else
+            echo "::warning::Could not fetch Loom metadata (non-fatal)"
+          fi
+
       - name: Resolve Loom version
         run: |
           set -euo pipefail
           fetch() { curl -fsSL -A flowstate-ci "$1" 2>/dev/null || true; }
           valid() { printf '%s' "$1" | grep -qE '^[0-9]+(\.[0-9]+)+$'; }
 
-          REQ="${{ inputs.loom_version || 'latest' }}"
+          REQ="${{ inputs.loom_version || '1.11.8' }}"
           LOOM=""
           if [ "$REQ" != "latest" ]; then
             LOOM="$REQ"
-            echo "Loom pinned manually: $LOOM"
           else
-            # Источник 1 (правильные координаты артефакта): net.fabricmc:fabric-loom
             META="$(fetch https://maven.fabricmc.net/net/fabricmc/fabric-loom/maven-metadata.xml)"
             if [ -n "$META" ]; then
-              RELEASES="$(printf '%s' "$META" | grep -o '<version>[^<]*</version>' \
-                | sed 's/<[^>]*>//g' | grep -viE 'SNAPSHOT|alpha|beta|pre|rc' || true)"
-              if [ -n "$RELEASES" ]; then
-                printf '%s\n' "$RELEASES" | sort -V | tail -n 5 | sed 's/^/  loom candidate: /'
-                LOOM="$(printf '%s\n' "$RELEASES" | sort -V | tail -n 1)"
-                echo "Detected newest Loom release: $LOOM"
-              fi
-            else
-              echo "net.fabricmc:fabric-loom metadata unavailable - trying plugin marker"
+              CAND="$(printf '%s' "$META" | grep -o '<version>[^<]*</version>' | sed 's/<[^>]*>//g' \
+                | grep -viE 'SNAPSHOT|alpha|beta|pre|rc' | sort -V | tail -n 1 || true)"
+              valid "$CAND" && LOOM="$CAND"
             fi
-            # Источник 2 (резерв): marker-артефакт плагина
-            if ! valid "$LOOM"; then
-              META="$(fetch https://maven.fabricmc.net/fabric-loom/fabric-loom.gradle.plugin/maven-metadata.xml)"
-              if [ -n "$META" ]; then
-                CAND="$(printf '%s' "$META" | grep -o '<release>[^<]*</release>' | head -n1 | sed 's/<[^>]*>//g' || true)"
-                if valid "$CAND"; then
-                  echo "Detected via plugin marker: $CAND"
-                  LOOM="$CAND"
-                fi
-              fi
-            fi
-            # Источник 3 (гарантия): версия, существование которой доказано логом CI №6
             if ! valid "$LOOM"; then
               LOOM="1.11.8"
-              echo "::warning::Auto-detect failed, using known-good Loom 1.11.8"
+              echo "::warning::Auto-detect failed, falling back to known-good 1.11.8"
             fi
           fi
           if ! valid "$LOOM"; then
             echo "::error::Invalid loom_version input: '$LOOM'"
             exit 1
           fi
-
-          echo "Using Loom $LOOM"
           sed -i "s/id 'fabric-loom' version '[^']*'/id 'fabric-loom' version '$LOOM'/" build.gradle
-          grep -n "fabric-loom" build.gradle | sed 's/^/  build.gradle: /'
+          grep -n "fabric-loom" build.gradle
           echo "LOOM=$LOOM" >> "$GITHUB_ENV"
+          echo "Using Loom $LOOM"
 
       - name: Resolve & pin Fabric versions (strict 1.21.11)
         run: |
           set -euo pipefail
           REQUIRED_MC="1.21.11"
           UA="flowstate-ci (+https://github.com)"
-          PICK="${{ inputs.fabric_api_pick || 'latest' }}"
+          PICK="${{ inputs.fabric_api_pick || 'previous' }}"
 
           read_prop() {
             grep -m1 "^$1=" gradle.properties | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '[:space:]\r'
@@ -124,15 +121,15 @@ jobs:
             exit 1
           fi
 
-          YARN_JSON="$(curl -fsSL -A "$UA" https://meta.fabricmc.net/v2/versions/yarn)"
-          YARN="$(printf '%s' "$YARN_JSON" | jq -r --arg mc "$MC" '[.[] | select(.gameVersion == $mc)][0].version // empty')"
+          YARN="$(curl -fsSL -A "$UA" https://meta.fabricmc.net/v2/versions/yarn \
+            | jq -r --arg mc "$MC" '[.[] | select(.gameVersion == $mc)][0].version // empty')"
           if [ -z "$YARN" ]; then
             echo "::error::No Yarn mappings for $MC."
             exit 1
           fi
 
-          LOADER_JSON="$(curl -fsSL -A "$UA" https://meta.fabricmc.net/v2/versions/loader)"
-          LOADER="$(printf '%s' "$LOADER_JSON" | jq -r '[.[] | select(.stable == true)][0].version')"
+          LOADER="$(curl -fsSL -A "$UA" https://meta.fabricmc.net/v2/versions/loader \
+            | jq -r '[.[] | select(.stable == true)][0].version')"
 
           VERSIONS_JSON="$(curl -fsSL -A "$UA" \
             "https://api.modrinth.com/v2/project/fabric-api/version?game_versions=%5B%22${MC}%22%5D&loaders=%5B%22fabric%22%5D")"
@@ -146,7 +143,6 @@ jobs:
             FAPI="$(printf '%s' "$VERSIONS_JSON" | jq -r '.[0].version_number // empty')"
           fi
           if [ -z "$FAPI" ]; then
-            echo "Modrinth lookup failed, trying maven.fabricmc.net..."
             FAPI="$(curl -fsSL -A "$UA" https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml \
               | grep -o "<version>[^<]*+${MC}</version>" | sed 's/<[^>]*>//g' | sort -V | tail -n1 || true)"
           fi
@@ -159,27 +155,47 @@ jobs:
           sed -i "s/^loader_version=.*/loader_version=$LOADER/" gradle.properties
           sed -i "s/^fabric_version=.*/fabric_version=$FAPI/" gradle.properties
 
-          {
-            echo "YARN=$YARN"; echo "LOADER=$LOADER"; echo "FAPI=$FAPI"
-          } >> "$GITHUB_ENV"
+          { echo "YARN=$YARN"; echo "LOADER=$LOADER"; echo "FAPI=$FAPI"; } >> "$GITHUB_ENV"
           echo "Pinned: loom=${LOOM} | yarn=$YARN | loader=$LOADER | fabric-api=$FAPI (pick=$PICK)"
 
       - name: Build (compile + unit tests)
         id: build
         run: |
           set -o pipefail
-          gradle --no-daemon build --stacktrace 2>&1 | tee build_log.txt
+          gradle --no-daemon build --stacktrace --console=plain 2>&1 | tee build_log.txt
 
-      - name: Diagnose known failure modes
+      # Выжимка падения: на вкладку Summary и в лог шага. Работает всегда, когда упал Build.
+      - name: Failure digest
         if: failure() && steps.build.outcome == 'failure'
         run: |
-          if grep -q "Javadoc provided by mod" build_log.txt 2>/dev/null; then
-            echo "::error::Loom javadoc remapping failure. Try in this order:"
-            echo "::error::1) Re-run with clean_cache=true"
-            echo "::error::2) Re-run with fabric_api_pick=previous"
-            echo "::error::3) Re-run with loom_version set to a DIFFERENT release (see 'loom candidate:' lines in the Resolve step log of any default run)"
-          else
-            echo "::error::Build failed for a different reason - open the Build step log"
+          GRADLE_USED="${{ inputs.gradle_version || '8.14.2' }}"
+          if [ ! -f build_log.txt ]; then
+            echo "::error::No build log captured"
+            exit 0
+          fi
+          SUMMARY_FILE="$GITHUB_STEP_SUMMARY"
+          {
+            echo "## 🔎 FLOWSTATE failure digest"
+            echo
+            echo "loom=${LOOM} | fabric-api=${FAPI} | gradle=${GRADLE_USED}"
+            echo
+            echo '```text'
+            awk '/^\* What went wrong:/{f=1} /^\* Try:/{f=0} f' build_log.txt
+            echo
+            echo "--- Caused by chain ---"
+            grep 'Caused by:' build_log.txt | head -n 12
+            echo
+            echo "--- Key errors ---"
+            grep -nE 'error: |cannot find symbol|package .* does not exist|Failed to apply plugin|Minimum supported Gradle|Unsupported class' build_log.txt | head -n 40
+            echo '```'
+          } >> "$SUMMARY_FILE" 2>/dev/null || true
+          # Те же сведения в лог шага (видно и без Summary):
+          awk '/^\* What went wrong:/{f=1} /^\* Try:/{f=0} f' build_log.txt || true
+          grep 'Caused by:' build_log.txt | head -n 5 || true
+          # Автоподсказка для самого частого сценария:
+          MIN_GRADLE="$(grep -o 'Minimum supported Gradle version is [0-9.]*' build_log.txt | head -n1 | grep -o '[0-9.]*$' || true)"
+          if [ -n "$MIN_GRADLE" ]; then
+            echo "::notice::Loom требует Gradle >= ${MIN_GRADLE}. Перезапустите workflow с gradle_version=${MIN_GRADLE} и loom_version=latest."
           fi
 
       - name: Upload mod JARs
